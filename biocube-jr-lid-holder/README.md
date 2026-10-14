@@ -17,10 +17,10 @@ top catches the lid edge so the lid can't slide off. 8 in overall.
 
 ## Print settings
 
-* Material: PETG (PLA works but the LEDs get warm and the hood is humid, PLA can creep over time)
+* Material: PETG preferred, PLA is fine (load is tiny, so creep isn't a real risk; keep the prop off the LED panel and swap it if it ever looks bent)
 * Orientation: lying flat, exactly as the STL loads. No supports.
 * Layer height: 0.2 mm
-* Walls: 4 perimeters
+* Walls: 4 perimeters (5 if printing in PLA)
 * Top/bottom: 5 layers
 * Infill: 40% gyroid
 * Brim: optional, 5 mm if your PETG lifts at the ends
