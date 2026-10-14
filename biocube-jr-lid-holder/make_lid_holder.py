@@ -1,120 +1,162 @@
-"""Parametric lid prop for the AquaLife / Coralife BioCube JR hood.
+"""Parametric lid prop for the Coralife BioCube JR (14 gal) hinged hood.
 
-Layout (all mm, part lies flat for printing, X = length, Z = thickness):
+Side view, world frame (mm): X points toward the FRONT of the tank, Z is up.
+The rim's top surface is Z=0 and its outside front face is X=0, so the rim
+occupies X<0, Z<0. The hood hinge is at the back, about HINGE_TO_FRONT behind.
 
-  peg | shoulder foot | taper | strut ............ | flare | cradle (U notch)
-  x=0                                                              x=203.2 (8 in)
+  * Foot: an L hook. The pad sits on the rim, the lip hangs over the outside
+    front face. The lid load pushes the foot forward, the lip takes it.
+  * Strut: leans back toward the hinge at the angle the lid edge swings to.
+  * Head: a fork that straddles the hood's front edge (skirt). The slot is
+    lined up with the skirt at the open angle so the edge drops straight in
+    and is locked front to back. No friction needed.
 
-The 3/8 in peg drops into the slot in the tank rim, the wide shoulder sits on
-the rim around the slot, and the U notch at the top catches the lid edge/rib
-so the lid cannot slide off the prop.
+The profile is extruded THICK mm and printed lying flat.
 
 Run:  python3 make_lid_holder.py   (writes the STLs next to this script)
 """
 
 from pathlib import Path
 
+import numpy as np
 import trimesh
+from shapely.affinity import rotate, translate
 from shapely.geometry import Point, Polygon, box
 from shapely.ops import unary_union
 
 IN = 25.4
 
-# User measurements
-TOTAL_LEN = 8 * IN          # overall length, peg tip to cradle tips
-END_SIZE = 3 / 8 * IN       # 9.525, slot / lid feature size
+# Tank (Coralife lists the 14/16 footprint around 15 x 16.75 in). The hinge
+# to front edge distance is the one unknown that matters; the design is
+# checked across HINGE_RANGE below.
+HINGE_TO_FRONT = 15.5 * IN
+HINGE_RANGE = (14.0 * IN, 17.0 * IN)
 
-# Fit clearances (tuned for FDM, adjust if your printer runs tight or loose)
-PEG_CLEARANCE = 0.3         # peg comes out 0.3 under 3/8 in
-NOTCH_CLEARANCE = 0.5       # notch comes out 0.5 over 3/8 in
-
-THICK = END_SIZE - PEG_CLEARANCE   # whole part is peg-thick so the peg is square
-PEG_W = END_SIZE - PEG_CLEARANCE
-PEG_LEN = 10.0
-PEG_TIP_CHAMFER = 1.2
-
-SHOULDER_W = 28.0
-SHOULDER_LEN = 6.0
+TOTAL_LEN = 8 * IN          # overall part length, lip bottom to fork tip
+THICK = 16.0                # extrude depth = foot/head width across the tank
 STRUT_W = 20.0
-TAPER_LEN = 20.0
-FLARE_LEN = 15.0
-HEAD_W = 26.0
-HEAD_LEN = 16.0
-NOTCH_W = END_SIZE + NOTCH_CLEARANCE
-NOTCH_DEPTH = 11.0
-NOTCH_ENTRY_CHAMFER = 1.5
-CORNER_R = 1.5
+
+PAD_LEN = 22.0              # how far the pad reaches back over the rim top
+PAD_T = 8.0
+LIP_T = 7.0                 # lip thickness in front of the rim face
+LIP_DROP = 10.0             # how far the lip hangs down the rim face
+CORNER_RELIEF_R = 1.5       # lets the L seat on a sharp or burred rim corner
+
+SKIRT_T = 3 / 8 * IN        # lid edge thickness (your 3/8 in measurement)
+SLOT_W = 14.0               # SKIRT_T + room for angle error and a thicker edge
+SLOT_DEPTH = 18.0           # outer tine length from the seat
+INNER_TINE_DEPTH = 9.0      # short inner tine so it clears ribs inside the hood
+TINE_T = 7.0
+HEAD_BACK = 9.0             # material below the seat
 
 
-def outline(total_len=TOTAL_LEN):
-    """2D profile in the XY plane, X along the length, centered on Y=0."""
-    x_sh0 = PEG_LEN
-    x_sh1 = x_sh0 + SHOULDER_LEN
-    x_strut0 = x_sh1 + TAPER_LEN
-    x_head0 = total_len - HEAD_LEN
-    x_strut1 = x_head0 - FLARE_LEN
+def lid_pose(contact_len, hinge_to_front):
+    """Lid open angle and prop lean for a prop of contact_len between the rim
+    corner and the lid edge seat. Edge point E = (-d + d cos t, d sin t)."""
+    d = hinge_to_front
+    t = np.linspace(1e-4, 1.4, 200001)
+    ex, ez = -d + d * np.cos(t), d * np.sin(t)
+    i = np.argmin(abs(np.hypot(ex, ez) - contact_len))
+    theta = t[i]
+    lean = np.arctan2(-ex[i], ez[i])
+    return theta, lean
 
-    body = Polygon([
-        (x_sh0, -SHOULDER_W / 2), (x_sh1, -SHOULDER_W / 2),
-        (x_strut0, -STRUT_W / 2), (x_strut1, -STRUT_W / 2),
-        (x_head0, -HEAD_W / 2), (total_len, -HEAD_W / 2),
-        (total_len, HEAD_W / 2), (x_head0, HEAD_W / 2),
-        (x_strut1, STRUT_W / 2), (x_strut0, STRUT_W / 2),
-        (x_sh1, SHOULDER_W / 2), (x_sh0, SHOULDER_W / 2),
+
+def build(contact_len):
+    theta, lean = lid_pose(contact_len, HINGE_TO_FRONT)
+    axis = np.array([-np.sin(lean), np.cos(lean)])        # base -> seat
+    u = np.array([-np.sin(theta), np.cos(theta)])          # skirt, edge -> into lid
+    n = np.array([np.cos(theta), np.sin(theta)])           # outward from the hood
+    seat = axis * contact_len
+
+    pad = box(-PAD_LEN, 0, 0, PAD_T)
+    lip = box(0, -LIP_DROP, LIP_T, PAD_T)
+
+    strut_len = contact_len + 1
+    strut = box(-STRUT_W / 2, 0, STRUT_W / 2, strut_len)
+    strut = rotate(strut, np.degrees(lean), origin=(0, 0))
+    strut = strut.difference(box(-500, -500, 500, 0))      # nothing below rim top...
+    strut = unary_union([strut, lip, pad])
+
+    def along(p0, du, dn):
+        return tuple(p0 + u * du + n * dn)
+
+    half = SLOT_W / 2 + TINE_T
+    head = Polygon([along(seat, -HEAD_BACK, -half), along(seat, SLOT_DEPTH, -half),
+                    along(seat, SLOT_DEPTH, half), along(seat, -HEAD_BACK, half)])
+    head = head.buffer(1.5, join_style="round")
+    # round bottomed slot (seat at its lowest point) with a flared mouth
+    r = SLOT_W / 2
+    c0 = seat + u * r
+    slot = unary_union([
+        Point(*c0).buffer(r, resolution=48),
+        Polygon([along(c0, 0, -r), along(c0, 60, -r), along(c0, 60, r), along(c0, 0, r)]),
+        Polygon([along(seat, SLOT_DEPTH - 2.5, -r), along(seat, SLOT_DEPTH + 3, -r - 3),
+                 along(seat, SLOT_DEPTH + 3, r + 3), along(seat, SLOT_DEPTH - 2.5, r)]),
     ])
-    # round the outside corners so nothing snags or cracks at a sharp point
-    body = body.buffer(-CORNER_R, join_style="round").buffer(CORNER_R, join_style="round")
+    inner_trim = Polygon([along(seat, INNER_TINE_DEPTH, -60), along(seat, 60, -60),
+                          along(seat, 60, -r + 0.01), along(seat, INNER_TINE_DEPTH, -r + 0.01)])
+    head = head.difference(slot).difference(inner_trim)
 
-    # U notch with a round bottom (no sharp inside corner to start a crack)
-    r = NOTCH_W / 2
-    x_notch_bottom = total_len - NOTCH_DEPTH + r
-    notch = unary_union([
-        box(x_notch_bottom, -r, total_len + 1, r),
-        Point(x_notch_bottom, 0).buffer(r, resolution=32),
-        Polygon([
-            (total_len - NOTCH_ENTRY_CHAMFER, -r), (total_len + 0.01, -r - NOTCH_ENTRY_CHAMFER),
-            (total_len + 0.01, r + NOTCH_ENTRY_CHAMFER), (total_len - NOTCH_ENTRY_CHAMFER, r),
-        ]),
-    ])
-    body = body.difference(notch)
+    part = unary_union([strut, head]).difference(slot)
+    part = part.difference(box(-500, -500, 0, 0))          # ...and never inside the rim
+    part = part.difference(Point(0, 0).buffer(CORNER_RELIEF_R, resolution=24))
+    # soften outside corners
+    part = part.buffer(-1.0, join_style="round").buffer(1.0, join_style="round")
+    if part.geom_type != "Polygon":
+        part = max(part.geoms, key=lambda g: g.area)
+    return part, dict(theta=theta, lean=lean, seat=seat, axis=axis, u=u)
 
-    c = PEG_TIP_CHAMFER
-    peg = Polygon([
-        (0, -PEG_W / 2 + c), (c, -PEG_W / 2), (PEG_LEN + 1, -PEG_W / 2),
-        (PEG_LEN + 1, PEG_W / 2), (c, PEG_W / 2), (0, PEG_W / 2 - c),
-    ])
-    return unary_union([body, peg])
+
+def overall_length(part, axis):
+    pts = np.array(part.exterior.coords)
+    proj = pts @ axis
+    return proj.max() - proj.min()
+
+
+def solve_contact_len():
+    lo, hi = 120.0, 200.0
+    for _ in range(40):
+        mid = (lo + hi) / 2
+        part, info = build(mid)
+        if overall_length(part, info["axis"]) > TOTAL_LEN:
+            hi = mid
+        else:
+            lo = mid
+    return lo
+
+
+def lay_flat(part, axis):
+    """Rotate so the strut runs along X on the bed, origin at 0,0."""
+    flat = rotate(part, -np.degrees(np.arctan2(axis[1], axis[0])), origin=(0, 0))
+    minx, miny, _, _ = flat.bounds
+    return translate(flat, -minx, -miny)
 
 
 def extrude(poly):
-    mesh = trimesh.creation.extrude_polygon(poly, THICK)
+    # drop near duplicate points left by the booleans, they break the triangulation
+    mesh = trimesh.creation.extrude_polygon(poly.simplify(0.01), THICK)
     mesh.merge_vertices()
     return mesh
 
 
-def fit_test():
-    """Just the peg, shoulder and a stub, about 5 minutes to print."""
-    full = outline()
-    return full.intersection(box(-1, -50, PEG_LEN + SHOULDER_LEN + 8, 50))
-
-
-def notch_test():
-    """Just the cradle head, to check it grabs the lid edge before the full print."""
-    full = outline()
-    return full.intersection(box(TOTAL_LEN - HEAD_LEN - 6, -50, TOTAL_LEN + 1, 50))
-
-
 if __name__ == "__main__":
     out = Path(__file__).parent
+    contact_len = solve_contact_len()
+    part, info = build(contact_len)
+    foot_test = part.intersection(box(-60, -60, 40, 34))
+    head_test = part.intersection(Point(*info["seat"]).buffer(34))
     parts = {
-        "biocube_jr_lid_holder.stl": outline(),
-        "fit_test_peg.stl": fit_test(),
-        "fit_test_notch.stl": notch_test(),
+        "biocube_jr_lid_holder.stl": part,
+        "fit_test_foot.stl": foot_test,
+        "fit_test_fork.stl": head_test,
     }
     for name, poly in parts.items():
-        mesh = extrude(poly)
+        mesh = extrude(lay_flat(poly, info["axis"]))
         assert mesh.is_watertight, name
         mesh.export(out / name)
         ext = mesh.bounds[1] - mesh.bounds[0]
         print(f"{name}: {ext[0]:.1f} x {ext[1]:.1f} x {ext[2]:.1f} mm, "
               f"{mesh.volume / 1000:.1f} cm3, watertight={mesh.is_watertight}")
+    print(f"contact length {contact_len:.1f} mm, overall {overall_length(part, info['axis']) / IN:.2f} in")
+    print(f"design: lid opens {np.degrees(info['theta']):.1f} deg, prop leans {np.degrees(info['lean']):.1f} deg")

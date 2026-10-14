@@ -1,8 +1,14 @@
 # BioCube JR lid holder
 
-Prop that holds the BioCube JR hood open. The 3/8 in peg drops into the slot in
-the tank rim, the wide shoulder sits on the rim, and the 3/8 in U notch at the
-top catches the lid edge so the lid can't slide off. 8 in overall.
+Prop that holds the Coralife BioCube JR (14 gal) hood open. 8 in overall.
+
+* **Top fork** straddles the hood's front edge (up to about 1/2 in thick) and locks it
+  front to back, so the lid can't slide off. The inner tine is short so it clears
+  ribs inside the hood.
+* **Bottom hook** sits on the rim at the front and its lip hangs over the outside
+  face. The lid's weight pushes the foot forward, which is exactly what the lip stops.
+* Built at the 12.5 deg lean the lid edge swings to, so the load runs straight down
+  the strut. Lid opens about 25 deg, front edge about 6.5 in above the rim.
 
 ![preview](preview.png)
 
@@ -11,26 +17,32 @@ top catches the lid edge so the lid can't slide off. 8 in overall.
 | File | What it is |
 | --- | --- |
 | `biocube_jr_lid_holder.stl` | The holder |
-| `fit_test_peg.stl` | Peg end only, print first to check the rim slot fit |
-| `fit_test_notch.stl` | Notch end only, print first to check the lid edge fit |
-| `make_lid_holder.py` | Generator, change `PEG_CLEARANCE` / `NOTCH_CLEARANCE` and rerun if the fit is off |
+| `fit_test_foot.stl` | Foot only, check it hooks your rim |
+| `fit_test_fork.stl` | Fork only, check it drops over the hood's front edge |
+| `make_lid_holder.py` | Generator. Change `SLOT_W`, `LIP_DROP`, `HINGE_TO_FRONT` etc and rerun |
 
-## Print settings
+## Print settings (PLA)
 
-* Material: PETG preferred, PLA is fine (load is tiny, so creep isn't a real risk; keep the prop off the LED panel and swap it if it ever looks bent)
-* Orientation: lying flat, exactly as the STL loads. No supports.
+* Orientation: flat, exactly as the STL loads. No supports.
 * Layer height: 0.2 mm
-* Walls: 4 perimeters (5 if printing in PLA)
+* Walls: 5
 * Top/bottom: 5 layers
 * Infill: 40% gyroid
-* Brim: optional, 5 mm if your PETG lifts at the ends
-* Elephant foot compensation on (or lightly sand the bottom edge of the peg)
+* Brim: not needed
 
-## Strength check
+## Math
 
-Part is 20 x 9.2 mm in section. Euler buckling for an 8 in pinned PETG column is
-about 620 N (140 lbf). The hood weighs a few pounds and the prop only carries part
-of that since the hinge takes the rest, so the margin is huge. Printed flat, the
-load runs along the extrusion lines, which is the strongest direction for FDM.
+Hood weight isn't published; a replacement 14/16 canopy is listed at 4.5 lb, used as the worst case.
 
-Regenerate with `pip install trimesh shapely mapbox_earcut && python3 make_lid_holder.py`.
+| Hinge to front | Lid opens | Lean | Fork misalignment | Prop load |
+| --- | --- | --- | --- | --- |
+| 14 in | 27.7 deg | 13.8 deg | +1.4 deg | 2.05 lb |
+| 15.5 in (design) | 24.9 deg | 12.5 deg | 0 | 2.09 lb |
+| 17 in | 22.7 deg | 11.4 deg | -1.1 deg | 2.12 lb |
+
+* Buckling (PLA, conservative E = 2 GPa): about 1050 lb. Whole 4.5 lb hood on it: 233x margin.
+* Strut stress 0.06 MPa, worst case tine bending 2.8 MPa, PLA is about 50 MPa. No creep concern.
+* A 3/8 in edge fits the 14 mm fork across the full 14 to 17 in range (needs 9.7 mm max).
+* Foot tilt across that range lifts the pad under 0.6 mm, the lip still hangs 10 mm.
+
+Regenerate with `pip install trimesh shapely mapbox_earcut numpy && python3 make_lid_holder.py`.
