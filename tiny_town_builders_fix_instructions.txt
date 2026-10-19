@@ -1,0 +1,755 @@
+TINY TOWN BUILDERS: SERVER FIX INSTRUCTIONS FOR CLAUDE
+=====================================================
+
+WHO THIS IS FOR
+You are Claude, working inside Roblox Studio (through the Roblox Studio MCP if it is connected).
+A full code review of this game's server found the bugs and exploits below. Your job is to apply
+every fix in this file, in the order given, then run the tests at the end.
+
+GROUND RULES (read before touching anything)
+1. Read each function in Studio BEFORE you edit it. The snippets below were taken from a text dump of the
+   code; whitespace, comments, or nearby lines may differ slightly. Match on the code, not on line numbers.
+2. Keep every existing function name and signature exactly as it is. You may ADD new functions and new
+   module level locals. Do not rename, reorder parameters, or change return values of existing functions.
+3. Do not touch Studio only test hooks (anything gated by RunService:IsStudio(), _setXxx test seams,
+   simPass, seedDemo, etc). They are expected.
+4. The server is authoritative. Never move a check to the client. Treat every client value as hostile.
+5. Most server modules live in ServerScriptService/Server/<Name>. Shared modules are in
+   ReplicatedStorage/Shared/<Name>. Main is the server Script in ServerScriptService/Server that wires
+   the remotes. If a path differs, find the module by name.
+6. If a fix does not fit the real code (a variable has a different name, a function is missing), stop,
+   read the surrounding code, and adapt the fix so it does the same thing. Never guess silently. If you
+   still cannot make it fit, write a comment "-- REVIEW FIX <ID> NOT APPLIED: <reason>" at that spot and
+   tell the user.
+7. After each fix, run a Play test (or Team Test with 2 players where the test says so) and check the
+   Output window for errors before moving on.
+8. When a session or debugging problem cannot be found by reading code, debug it live through the
+   Roblox Studio MCP (run code on server/client, read Output) instead of guessing.
+
+ORDER OF WORK
+  1. C-1  VisualProgress cash dupe            (Critical)
+  2. W-1  AFK bonus is client controlled      (High)
+  3. E-1  BIG PAYDAY x3 never runs out        (Medium)
+  4. W-3  AFK reconnect ignores input         (Medium)
+  5. P-4  Visit slot void / slot leak         (Medium)
+  6. P-1  Gift save spam                      (Medium)
+  7. P-2  PetAnnounce broadcast spam          (Medium)
+  8. E-2  Quest rewards inflated              (Medium)
+  9. V-1  Grand building union timeout        (Medium)
+ 10. P-3  Fused Rainbow fills the book        (Low)
+ 11. A-1  Admin finishBuild ticks everyone    (Low)
+ 12. V-2  Union collision fidelity            (Low)
+ 13. L-1 .. L-22  smaller Low fixes
+ 14. Tests
+
+
+=====================================================================================================
+FIX 1: C-1 (CRITICAL) VisualProgress cash dupe
+Module: ServerScriptService/Server/BuildService
+Function: local function payParts(player, record)
+=====================================================================================================
+WHAT IS WRONG
+payParts computes placed = min(server placed, record.visual), where record.visual is the count the
+client reports through the VisualProgress remote. When that is 0 it resets record.paid = 0.
+A hacked client fires VisualProgress(0) then VisualProgress(N) (N = real count). The first call
+resets paid, the second pays the whole build's per part cash again. Main allows 8 reports per second,
+so this repays the build 4 times a second. Negative or -math.huge counts also clamp to 0.
+
+FIND (inside payParts):
+	local paid = record.paid or 0
+	if placed == 0 then
+		record.paid = 0
+	elseif due > paid then
+
+REPLACE WITH:
+	local paid = record.paid or 0
+	if record.state:getPlaced() == 0 then -- only the SERVER's count may reset what was paid (a client report of 0 must not)
+		record.paid = 0
+	elseif due > paid then
+
+WHY THIS IS ENOUGH
+A fake 0 now gives due = 0 and pays nothing, and paid stays where it was. A fake N afterwards gives the
+same due as before, which is not greater than paid, so nothing is paid twice. Rebirth (resetRun) and a
+new build still reset paid because the server count really is 0 then.
+Do NOT make record.visual "monotonic"; that would break the visual gate at the start of each build.
+
+
+=====================================================================================================
+FIX 2: W-1 (HIGH) AFK bonus is controlled by the client
+Module: ServerScriptService/Server/AfkService  (+ one line in many handlers)
+=====================================================================================================
+WHAT IS WRONG
+a) Only the client's "active"/"stop" messages end AFK. A hacked client never sends them: it sends
+   "start" 15 s after its last "active", keeps "beat" alive, and plays normally while earning x1.5 to x2
+   on every payout (the bonus applies AFTER the cash ceiling).
+b) "busy" = true, resent every few seconds, blocks the reconnect forever (isSafe), but bonusFraction
+   ignores busy, so the player keeps the bonus and is never reconnected.
+c) TeleportData passes through the client. A client can teleport itself with forged
+   { afkReconnect = true, t = now, afkStart = now - 1800 } which sets afkCarry, skips the 10 minute
+   minimum session, and starts the ramp at the cap.
+
+STEP 2.1  Add near the top of AfkService (with the other requires / helpers):
+
+local ExtraStore = require(script.Parent.ExtraStore)
+
+local function rootPos(player: Player): Vector3?
+	local character = player.Character
+	local root = if character ~= nil then character:FindFirstChild("HumanoidRootPart") else nil
+	return if root ~= nil and root:IsA("BasePart") then root.Position else nil
+end
+
+STEP 2.2  In local function beginAfk(st), after the line  st.lastBeat = t  add:
+
+	st.afkPos = rootPos(st.player) -- moving away from here ends AFK (AfkService.tick)
+
+(If the State type is declared with strict fields, add  afkPos: Vector3?,  hopT: number?  to it.)
+
+STEP 2.3  In local function bonusFraction(st, t), right after the first early return
+          (if not (st.afk and st.bonusEligible) then return 0 end) add:
+
+	if st.busy and t - st.busyAt < cfg().busyExpiry then
+		return 0 -- "busy" holds the reconnect off, so it can not also earn the bonus
+	end
+
+STEP 2.4  In function AfkService.tick(), at the top of the loop body
+          (for player, st in states do), before  local enabled = enabledFor(player)  add:
+
+		if st.afk and st.afkPos ~= nil then
+			local p = rootPos(player)
+			if p ~= nil and (p - st.afkPos).Magnitude > 10 then
+				endAfk(st, "moved") -- the server saw the character move: not AFK
+			end
+		end
+		if st.hopT ~= nil and ExtraStore.snapshot(player) ~= nil then
+			-- the profile is loaded: believe the carried AFK time only if the old server saved this exact hop
+			local hop: any = ExtraStore.get(player, "afkHop", nil)
+			if type(hop) == "table" and hop.t == st.hopT and type(hop.start) == "number" then
+				st.afkCarry = math.clamp(os.time() - hop.start, 0, cfg().reconnectSeconds + AfkService.BONUS.graceSeconds)
+			end
+			ExtraStore.set(player, "afkHop", {}) -- one use
+			st.hopT = nil
+		end
+
+STEP 2.5  Add a new public function (anywhere after endAfk is defined):
+
+-- Server side proof of input: Main and the services call this from every ACTION remote
+-- (a hacked client can simply never send "active").
+function AfkService.noteInput(player: any)
+	local st = states[player]
+	if st == nil then
+		return
+	end
+	st.lastActive = now()
+	if st.afk then
+		endAfk(st, "server_input")
+	end
+end
+
+STEP 2.6  In function AfkService.addPlayer(player), stop trusting afkStart from TeleportData.
+FIND:
+			local start = data.afkStart
+			if type(start) == "number" and start == start and start <= data.t + 5 then
+				local elapsed = os.time() - start
+				if elapsed >= 0 then
+					st.afkCarry = math.min(elapsed, c.reconnectSeconds + AfkService.BONUS.graceSeconds)
+				end
+			end
+REPLACE WITH:
+			st.hopT = data.t -- the carry is only believed once the saved profile confirms this hop (AfkService.tick)
+Also add  hopT = nil, afkPos = nil,  to the st table literal in addPlayer if the type needs it.
+
+STEP 2.7  In local function runReconnect(st): record the hop in the profile BEFORE the save.
+FIND the start of step 1:
+	local saved = false
+	if saveSvc ~= nil then
+INSERT ABOVE IT:
+	local hopAt = os.time()
+	local hopStart = hopAt - math.floor(st.afkCarry + math.max(0, now() - st.afkSince))
+	ExtraStore.set(player, "afkHop", { t = hopAt, start = hopStart }) -- saved by saveNow below; the next server checks it
+
+Then in the teleport loop FIND:
+		local unix = os.time()
+		options:SetTeleportData({ afkReconnect = true, t = unix, afkStart = unix - math.floor(st.afkCarry + math.max(0, now() - st.afkSince)) })
+REPLACE WITH:
+		options:SetTeleportData({ afkReconnect = true, t = hopAt })
+
+STEP 2.8  Call AfkService.noteInput(player) from every ACTION handler, right after the handler has
+confirmed the player is valid (after the isPlayer / typeof check), BEFORE the rate limiter returns.
+In Main (it can require AfkService directly; it already does in setCashMultiplier):
+   HireWorker, Promote, BuyUpgrade, UnlockBlueprint, QueueBlueprint, UnqueueBlueprint, Tutorial,
+   PlaceBuilding, MoveBuilding, ReplaceBuilding, DemolishBuilding, ExpandIsland, SetAutoPlace,
+   SetAutoSell, CarryPlace, Rebirth, Cheer, GoTo.
+   Line to add:   require(script.Parent.AfkService).noteInput(player)
+In the services that own their own remotes, add the same call wrapped in pcall so a require cycle
+can never break them:
+   PetService (HatchEgg, EquipPet, EquipBest, DeletePets, LockPet, FusePets, FuseAllPets inside the
+   guarded(...) wrappers), PetSocial (GiftPet, GiftResponse), PetBook (ClaimBookReward),
+   CodeService (RedeemCode), QuestService handle (claim / reroll / bonus only, NOT "get"),
+   RewardService (ClaimDaily, ClaimFreeEgg), VisitService (visit / like / leave, NOT "friends").
+   Line to add:   pcall(function() require(script.Parent.AfkService).noteInput(player) end)
+DO NOT call it from passive remotes: VisualProgress, Afk, EventUpdate, ClientReady,
+Leaderboard "get"/"refresh", CodesState, Gamepasses "list", Settings, Visit "friends", ClaimQuest "get".
+Those fire on timers while the player is genuinely away.
+
+Known tradeoff to tell the user: an honest AFK player who leaves a shop open (client sends busy)
+gets no bonus while it is open.
+
+
+=====================================================================================================
+FIX 3: E-1 (MEDIUM) BIG PAYDAY x3 never runs out for an away player
+Modules: BuildService (add one function), Main (one line)
+=====================================================================================================
+WHAT IS WRONG
+EventService.payMultiplier gives x3 while paydayUsed < count, and recordBuild only counts COMPLETED
+builds. Away income uses the same cash multiplier. A client that reports away = true never completes
+a build, so it earns x3 away income for the whole 30 minute event (and can toggle away to reset the
+1800 s stretch).
+
+STEP 3.1  In BuildService, AFTER  local function isAway(record, t)  is defined, add:
+
+-- Is this player's client reporting "away" (tabbed out / not drawing) right now? Main uses it to keep
+-- per player event boosts (BIG PAYDAY) off away income.
+function BuildService.isAway(player: PlayerKey): boolean
+	local record = if player ~= nil then records[player] else nil
+	return record ~= nil and isAway(record, os.clock())
+end
+
+STEP 3.2  In Main, inside BuildService.setCashMultiplier(function(player) ... end):
+FIND:
+		* EventService.payMultiplier(player)
+REPLACE WITH:
+		* (if BuildService.isAway(player) then EventService.cashMultiplier() else EventService.payMultiplier(player))
+
+
+=====================================================================================================
+FIX 4: W-3 (MEDIUM) AFK reconnect ignores input and safety once started
+Module: AfkService  (functions onEvent, runReconnect)
+=====================================================================================================
+WHAT IS WRONG
+Once st.reconnecting is true, "active" is ignored. isSafe is checked once, before saveNow yields for
+seconds; a player who comes back, opens a purchase prompt, or gets a gift during that save is still
+teleported.
+
+STEP 4.1  In local function onEvent:
+FIND:
+		st.lastActive = t
+		if st.afk and not st.reconnecting then
+			endAfk(st, "input")
+		end
+REPLACE WITH:
+		st.lastActive = t
+		if st.afk then
+			endAfk(st, "input") -- also during a reconnect: runReconnect sees st.afk == false and cancels
+		end
+
+STEP 4.2  In local function runReconnect(st):
+a) DELETE the line   st.lastReconnectAt = now()   that sits just before  note(player, "reconnect_start", nil)
+b) Inside the while loop, right after the block
+			if not st.afk or not enabledFor(player) then ... return end
+   and BEFORE  attempts += 1 , add:
+		local safe, why = AfkService.isSafe(player) -- the save yielded: a purchase, gift, visit or event may have started
+		if not safe then
+			st.reconnecting = false
+			postpone(st, why or "unsafe")
+			return
+		end
+c) After the while loop ends, right BEFORE  note(player, "reconnect_gave_up", tostring(attempts)) , add:
+	st.lastReconnectAt = now()
+(lastReconnectAt moves after the loop because isSafe refuses with "rate_limited" when it was set
+moments ago; setting it before the loop would make the new recheck always fail.)
+
+
+=====================================================================================================
+FIX 5: P-4 (MEDIUM) Visit slot: fall into the void + slot leak
+Module: VisitService  (function that handles the "visit" action, snapshot / offline branch)
+=====================================================================================================
+WHAT IS WRONG
+a) A player alone on an offline island who visits the SAME owner again: the shared slot is found,
+   then endVisit(player, false, nil) frees it (sole visitor), which destroys the model and sets
+   slots[i] = nil; the player is then teleported to the dead slot and falls into the void.
+b) Two quick visit calls both yield inside OfflineView.snapshot with previous == nil; both build a
+   slot; the first slot keeps the player as a visitor forever. After VisitService.SLOTS leaks, nobody
+   on the server can visit offline islands until shutdown.
+
+STEP 5.1  Module level, near the other tables (slots, visits):
+local fetching: { [any]: boolean } = {} -- players whose offline snapshot is loading (one at a time)
+
+STEP 5.2  In the visit function, FIND the snapshot branch comment and the first lines after it:
+	-- SNAPSHOT: offline / another server. An existing visit plot of the same owner is shared.
+	local shared: Slot? = nil
+INSERT between the comment and  local shared :
+	if previous ~= nil and previous.kind == "snapshot" and previous.ownerId == ownerId then
+		return false, "already_here" -- endVisit below would destroy the very slot we would reuse
+	end
+	if fetching[player] then
+		return false, "busy"
+	end
+
+STEP 5.3  FIND:
+		local ok, result = OfflineView.snapshot(player, ownerId)
+		if not ok then
+			return false, result
+		end
+REPLACE WITH:
+		fetching[player] = true
+		local okCall, ok, result = pcall(OfflineView.snapshot, player, ownerId)
+		fetching[player] = nil
+		if not okCall or player.Parent == nil then
+			return false, "busy"
+		end
+		previous = visits[player] -- re-read: another call may have changed it during the yield
+		if not ok then
+			return false, result
+		end
+(`previous` must be a local that can be reassigned; it is declared earlier in the same function.
+If it is declared differently, adapt.)
+
+STEP 5.4  In VisitService's player removing / removePlayer function add:
+	fetching[player] = nil
+
+Check what the client shows for reasons "already_here" and "busy"; if VisitPanel has a reason to text
+table, add friendly strings ("You are already here", "One moment...").
+
+
+=====================================================================================================
+FIX 6: P-1 (MEDIUM) Gift ping pong burns the DataStore write budget
+Module: PetSocial  (local function persist)
+=====================================================================================================
+WHAT IS WRONG
+Every accepted gift calls saveNow for both profiles. Two players passing a pet back and forth burn
+the UpdateAsync budget; ProfileStore keeps only 5 in reserve, so other players' autosaves get
+deferred.
+
+STEP 6.1  Module level:
+local PERSIST_GAP = 30 -- seconds between gift saves of the same player
+local persistedAt: { [any]: number } = {}
+
+STEP 6.2  Replace the body of local function persist(a, b) (keep the signature):
+local function persist(a: any, b: any)
+	local save = deps.save
+	if save == nil then
+		return
+	end
+	local t = os.clock()
+	if t - (persistedAt[a] or -math.huge) < PERSIST_GAP or t - (persistedAt[b] or -math.huge) < PERSIST_GAP then
+		return -- one of them was saved moments ago: skip BOTH (a crash then rolls both back together); the 60 s autosave covers it
+	end
+	persistedAt[a], persistedAt[b] = t, t
+	for _, p in { a, b } do
+		task.spawn(function()
+			pcall(save.saveNow, save, p)
+		end)
+	end
+end
+
+STEP 6.3  In PetSocial's removePlayer / PlayerRemoving handler add:  persistedAt[player] = nil
+
+
+=====================================================================================================
+FIX 7: P-2 (MEDIUM) PetAnnounce broadcast spam
+Module: PetService  (function PetService.announce)
+=====================================================================================================
+WHAT IS WRONG
+FireAllClients runs for every Rare+ or non Normal result; only super tiers are throttled. Every fuse
+makes Golden or better, so fuse spam floods every client (phones feel it).
+
+STEP 7.1  Module level (next to superNewsAt):
+local NEWS_GAP = 8 -- seconds between ordinary (non super) announcements of one player
+local newsAt: { [any]: number } = {}
+
+STEP 7.2  In PetService.announce FIND:
+			if PetData.isSuper(r.variant) and not superNewsAllowed(player) then
+				continue
+			end
+ADD RIGHT AFTER IT:
+			if not PetData.isSuper(r.variant) then
+				local clockNow = os.clock()
+				if clockNow - (newsAt[player] or -math.huge) < NEWS_GAP then
+					continue
+				end
+				newsAt[player] = clockNow
+			end
+
+STEP 7.3  In PetService.removePlayer add:  newsAt[player] = nil
+
+
+=====================================================================================================
+FIX 8: E-2 (MEDIUM) Quest rewards inflated by payday and the AFK bonus
+Module: QuestService  (local function payoutOf)
+=====================================================================================================
+WHAT IS WRONG
+payoutOf divides out only EventService.cashMultiplier(). BuildService.getCashMultiplier also contains
+BIG PAYDAY (x3) and the AFK bonus (x2), so quests rolled then pay up to 6x.
+
+FIND (inside the pcall in payoutOf):
+		return sum / n * BuildService.getCashMultiplier(player) / math.max(1, EventService.cashMultiplier())
+REPLACE WITH:
+		local afk = require(script.Parent.AfkService) :: any
+		return sum / n * BuildService.getCashMultiplier(player)
+			/ math.max(1, EventService.payMultiplier(player))
+			/ math.max(1, afk.bonusMultiplier(player))
+(It is already inside a pcall, so a require problem falls back to 250 like today.)
+
+
+=====================================================================================================
+FIX 9: V-1 (MEDIUM) Grand buildings fall back to loose parts forever
+Module: BuildingMerger  (config, warmOne)
+=====================================================================================================
+WHAT IS WRONG
+The 12 grand buildings take 16 to 120 s to union at run time. If the prebake in
+ServerStorage.MergedPrebuilt is missing or its signature is stale, merge runs with a 15 s timeout,
+falls back to plain parts, and that template is cached "ready" for the server's life: hundreds of
+loose parts per grand building on phones.
+
+STEP 9.1  In BuildingMerger.config FIND:
+	unionTimeout = 15, -- seconds one union may take before the group falls back
+REPLACE WITH:
+	unionTimeout = 130, -- runtime merges of grand buildings need 16 to 120 s; the prebake should make runtime merges rare
+
+STEP 9.2  In the warm function (the one that calls prebaked(id, bp) then BuildingMerger.merge(bp)):
+FIND:
+	local model, stats = prebaked(id, bp)
+	if model == nil then
+		model, stats = BuildingMerger.merge(bp)
+	end
+REPLACE WITH:
+	local model, stats = prebaked(id, bp)
+	if model == nil then
+		if #bp.parts > 400 then
+			warnf(`blueprint "{id}" has no matching prebake: merging at run time (slow). Re-run ServerStorage.Dev.BakeMerged before publishing.`)
+		end
+		model, stats = BuildingMerger.merge(bp)
+	end
+
+STEP 9.3  Run ServerStorage.Dev.BakeMerged in Studio now so every prebake signature matches, and tell
+the user to rerun it before every publish that changes a grand blueprint.
+
+
+=====================================================================================================
+FIX 10: P-3 (LOW) A fused Rainbow fills the Pet Book through a gift round trip
+Modules: PetService (fuse + transfer), PetBook (listener), PlayerData sanitize (pet entries)
+=====================================================================================================
+WHAT IS WRONG
+A fused Rainbow is excluded from the book only while the `fusing` flag is set. Gifting it to an alt
+and back makes transfer's noteAdded record it as a Rainbow, so duplicates alone complete the book's
+Rainbow rewards. BookData's header says a gifted Rainbow counts, so this is a loophole in that rule.
+
+STEP 10.1  In PetService's fuse code, where the new Rainbow pet entry is inserted into record.list,
+           add the field  fused = true  to that entry table.
+STEP 10.2  In PetService.transfer FIND:
+	table.insert(b.list, { id = id, kind = pet.kind, variant = pet.variant, locked = false })
+	local result: HatchResult = { id = id, kind = pet.kind, variant = pet.variant }
+REPLACE WITH:
+	table.insert(b.list, { id = id, kind = pet.kind, variant = pet.variant, locked = false, fused = pet.fused })
+	local result: HatchResult = { id = id, kind = pet.kind, variant = pet.variant, fused = pet.fused }
+(Add  fused: boolean?  to the HatchResult and pet entry types if strict mode complains.)
+STEP 10.3  In PetBook.start FIND:
+			if not (fusing and r.variant == "Rainbow") then
+REPLACE WITH:
+			if not ((fusing or r.fused == true) and r.variant == "Rainbow") then
+STEP 10.4  In the pet sanitize (PlayerData sanitize and/or PetService.addPlayer sanitize), keep
+           fused when it is exactly true:  fused = if raw.fused == true then true else nil
+           Without this the flag is lost on rejoin. Also make sure any other code that copies pet
+           entries (rewritePets in AdminService, exchange) carries fused along.
+
+
+=====================================================================================================
+FIX 11: A-1 (LOW) Admin finishBuild / skipBlueprint ticks every player
+Module: AdminService  (local function finishBuild)
+=====================================================================================================
+WHAT IS WRONG
+The loop calls BuildService.tick(0.25) up to 6000 times; tick runs EVERY player, so on a live server
+every away player instantly gets their full 1800 s of away income.
+
+At the top of local function finishBuild(player) add:
+	if #Players:GetPlayers() > 1 and not RunService:IsStudio() then
+		return false, "not_alone" -- BuildService.tick runs every player's build and away pay
+	end
+(Make sure Players and RunService are defined in AdminService; add GetService lines if not.)
+In the finishBuild handler, show a message for "not_alone": "Only works when you are alone in the server."
+
+
+=====================================================================================================
+FIX 12: V-2 (LOW) Union collision fidelity costs phones
+Module: BuildingMerger.config
+=====================================================================================================
+The comment says unions never collide and use Box, but the code uses PreciseConvexDecomposition and
+opaque unions collide (CanCollide = info.transparency < 0.05).
+FIND:
+	collisionFidelity = Enum.CollisionFidelity.PreciseConvexDecomposition,
+REPLACE WITH:
+	collisionFidelity = Enum.CollisionFidelity.Default, -- opaque unions collide; Precise decomposition is too heavy for phones
+Then fix the comment on that line and the MODEL LAYOUT header comment so they say what the code does.
+After the change, walk into a finished building in Play mode and make sure players cannot clip inside
+in a way that traps them. If the merger's raycast tests fail, report it to the user instead of reverting.
+
+
+=====================================================================================================
+FIX 13: SMALLER LOW FIXES (L-1 .. L-22)
+For each one: read the code first, apply the smallest change that does what is described.
+=====================================================================================================
+
+L-1  BuildSettle.arm: double arm makes the building walk through forever
+     Module BuildSettle, function BuildSettle.arm(model).
+     A second arm while the first loop runs records BUILD as the "original" group, so after both
+     loops finish the parts stay in BUILD. Add as the FIRST line of arm:
+	if model:GetAttribute("Settling") then
+		return -- already settling: the running loop re-reads the bounding box every poll, so it follows the move
+	end
+     Also: the city "rotate" path never calls BuildSettle.arm. Find where a building is rotated in
+     place (CityWorld / CityService) and call BuildSettle.arm(model) right after the pivot changes,
+     like move does.
+
+L-2  CharacterCollision.hook: one DescendantAdded connection appended per respawn
+     Module CharacterCollision. Replace the table.insert(st.conns, character.DescendantAdded:Connect(...))
+     with a single stored connection:
+	if st.descConn ~= nil then
+		st.descConn:Disconnect()
+	end
+	st.descConn = character.DescendantAdded:Connect(function(d: Instance)
+		...same body as today...
+	end)
+     and disconnect st.descConn where the player's state is removed.
+
+L-3  GamepassService.connect: per player connections never removed
+     Module GamepassService (the function that defines local onAdded). The CharacterAdded and the Studio
+     AttributeChanged connections go into self.connections and are never removed. Store them in a per
+     player table instead (self.playerConns = self.playerConns or {}; self.playerConns[player] = {...})
+     and in the existing PlayerRemoving handler disconnect them all and set self.playerConns[player] = nil.
+
+L-4  QuestService.claimBonus prices the bonus from a stale ctx after a rebirth
+     rec.ctx is built before a rebirth (higher income), and claimBonus pays bonusReward(state, rec.ctx or buildCtx(player), ...).
+     Add a public function to QuestService:
+	function QuestService.invalidate(player: any)
+		local rec = records[player]
+		if rec ~= nil then
+			rec.ctx = nil
+			rec.dirty = true
+		end
+	end
+     and call it from Main's RebirthService.configure({ after = function(player, result) ... }) callback:
+	QuestService.invalidate(player)
+
+L-5  AnalyticsService counts an AFK reconnect as a new session
+     Where AnalyticsService starts a session for a joining player, skip the session start event (keep
+     everything else) when  player:GetAttribute("AfkReconnectJoin") == true .
+     Note: AfkService sets that attribute in its own PlayerAdded handler; check the join order and read
+     the attribute at the moment the session event is sent. If AnalyticsService runs first, read
+     player:GetJoinData().TeleportData.afkReconnect instead (it is only a stat, so trusting it is fine).
+
+L-6  CityService: every city action forces a world sync, and the 7 actions have 7 separate rate buckets
+     So a spammer gets 7x the syncs. Add one shared limiter in CityService:
+	local cityLimiter = RateLimiter.new(4) -- all city actions together
+     take it FIRST in every city action (place, move, replace, demolish, expand, expandIsland,
+     setAutoPlace, setAutoSell) before the per action limiter, returning false, "rate_limited" when it
+     refuses, and call cityLimiter:remove(player) in CityService.removePlayer.
+
+L-7  LikeService: board writes ignore the request budget
+     In local function writeBoard(ownerId, total), add at the top (after the admin check):
+	if not budgetOk("update") then
+		return -- (the mirror keeps it; it is retried with the pending likes)
+	end
+     Read budgetOk first: it takes a kind argument; pass whatever kind the backend's budget(kind)
+     expects for UpdateAsync / board updates. Also raise LikeService.MIN_BUDGET from 4 to 8 so like
+     writes never eat ProfileStore's reserve of 5.
+
+L-8  LikeService.start creates LikeNotice only if the Remotes folder already exists
+     FIND: local folder = game:GetService("ReplicatedStorage"):FindFirstChild("Remotes")
+     REPLACE WITH: local folder = game:GetService("ReplicatedStorage"):WaitForChild("Remotes", 10)
+     Only if start() is not called from a place where yielding is a problem; if it is, spawn that block
+     with task.spawn.
+
+L-9  LeaderboardService refresh: a failed refresh never moves lastRefresh
+     So during a DataStore outage every check retries immediately. In the refresh function FIND:
+	if updated then
+		self.lastRefresh = self.now()
+     Change so lastRefresh is always set after an attempt:
+	self.lastRefresh = self.now()
+	if updated then
+		self:updateSign()
+		self:updateTags()
+	end
+
+L-10 CodesState: refresh = true skips the group membership cache every 0.5 s
+     In the CodesState OnServerInvoke (CodeService.start), keep a per player lastRefresh table and
+     pass refresh through only every 10 s:
+	local wantRefresh = refresh == true and t - (lastRefresh[player] or -math.huge) >= 10
+	if wantRefresh then
+		lastRefresh[player] = t
+	end
+	return CodeService.state(player, wantRefresh, afterJoin)
+     Clear lastRefresh[player] in the PlayerRemoving handler that already clears busy / attempts.
+
+L-11 Writes after a yield for players who already left (small leaks)
+     In each place below, after the yielding call returns, add
+	if typeof(player) == "Instance" and player.Parent == nil then return <same fallback as the failure path> end
+     before writing into a per player or per user cache:
+       PetSocial.lookupFriends (friendCache / byUser write after GetFriendsAsync)
+       VisitService friends list (cache write after the friends fetch)
+       CodeService.state (joinGrace write after the group check)
+       IslandName (lastChange write after text filtering)
+     Unbounded caches: OfflineView's negative cache, playedCache and names cache, and LikeService
+     totals. Give each entry a timestamp (most already have `at`) and, when inserting, drop entries
+     older than 10 minutes if the table has more than 500 entries.
+
+L-12 SocialService.goTo("hub") does not end a visit
+     VisitPanel calls Visit "leave" before GoTo, but TownPortal calls GoTo("hub") directly, and a
+     hacked client can skip it; the visit slot stays held for 20 minutes and cheering from the hub works.
+     At the top of SocialService.goTo, after validating dest, add:
+	pcall(function()
+		local visit = require(script.Parent.VisitService) :: any
+		if visit.getVisit(player) ~= nil then
+			visit.leave(player)
+		end
+	end)
+     Read VisitService first for the exact name of its leave function (the Visit remote handles
+     "leave"; use the same function that action calls). Watch for a require cycle; the pcall + lazy
+     require inside the function avoids load time cycles.
+
+L-13 SaveService: same server rejoin while the old release is still running
+     If a player leaves and rejoins the same server and the old release takes more than 20 s (store
+     outage), the new load proceeds. The lock check is skipped for the same jobId, so the new session
+     takes the lock, the old release then fails with lock_lost, and that last session's data is lost.
+     Read loadPlayer's "wait for the previous release" loop. If the release is still in flight after the
+     wait, do NOT load: return the "temporary" status so Main kicks with the existing "try again in a
+     minute" message. Do not change the lock logic for different servers.
+
+L-14 AfkService: the new server can hit the save lock while the old server is still releasing
+     (Plausible, not proven.) ProfileStore retries about 15 s, then the player is kicked. When the join
+     is an AFK reconnect (player:GetJoinData().TeleportData.afkReconnect == true), allow the load to
+     retry for up to 30 s before giving up. Implement it where SaveService/ProfileStore decides how long
+     to wait on a fresh foreign lock; only extend it for that case.
+
+L-15 InviteService: crafted LaunchData "inv=<userId>" lets fresh alts farm eggs for an inviter
+     Capped at 5 per day, needs the inviter in the same server. Make the reward wait until the joiner
+     has finished the tutorial: instead of granting in onJoin, remember the referrer on the joiner
+     (jb.pendingBy = referrerId) and call InviteService.process when TutorialService marks the
+     tutorial done. Keep all existing checks in process.
+
+L-16 LikeService: a never played alt can still give likes
+     Only the OWNER is checked for having played. In LikeService.like, before writing given[key],
+     refuse when the liker has not finished the tutorial:
+	local tut = (require(script.Parent.TutorialService) :: any).get(player)
+	if type(tut) ~= "table" or tut.done ~= true then
+		return false, "too_new", nil
+	end
+     (Wrap in pcall; check TutorialService.get's real return shape first.)
+
+L-17 CodeService maxUses is counted per server
+     No code uses maxUses yet. Add a comment at the maxUses check:
+     "-- per SERVER count, not global: do not rely on maxUses until it is stored in a DataStore."
+     Do not build the DataStore counter unless the user asks.
+
+L-18 Offline earnings pay a partly paid build again
+     SaveService.loadPlayer + Economy.offlineEarnings: offline completion pays the FULL payout of the
+     build that was in progress, although its placed parts were already paid per part online; and the
+     new partial build is resumed with paidEarlier = true so its share is deducted later. These roughly
+     cancel, so this is Low. Only fix if it is simple: save record.paid with the current build
+     (current.paid) and subtract it from the first offline completion's payout. Otherwise leave a
+     comment describing the mismatch.
+
+L-19 AdminService hatchFree keeps the cash loan when the admin holds egg tokens
+     PetService.hatch spends tokens first and cash only for the rest, so the full loan is not taken back.
+     FIND:
+	local price = egg.price * a.count
+     REPLACE WITH:
+	local price = egg.price * math.max(0, a.count - EggTokens.count(ctx.player, a.egg)) -- hatch uses tokens first
+     (Require EggTokens in AdminService if it is not already: require(script.Parent.EggTokens).)
+
+L-20 AdminService inviteSim leaks fake players
+     After the simulated invite, call ExtraStore.removePlayer(fake) for every fake joiner it created,
+     and clear simFriends[player] = nil in AdminService's player removing handler.
+
+L-21 AdminService setRebirths wipes the grandfathered rebirth cost
+     StatsService.addPlayer reads legacyUntil and turns nil into 0.
+     FIND:
+	StatsService.addPlayer(ctx.player, { totalCashEarned = stats.totalCashEarned, buildingsBuilt = stats.buildingsBuilt, rebirths = a.count })
+     REPLACE WITH:
+	StatsService.addPlayer(ctx.player, { totalCashEarned = stats.totalCashEarned, buildingsBuilt = stats.buildingsBuilt, rebirths = a.count, legacyUntil = stats.legacyUntil })
+
+L-22 EggTokens: rewards above 99 per egg vanish but the toast still shows
+     EggTokens.add clamps at MAX_PER_EGG = 99 and returns the new count. Change nothing in EggTokens'
+     signature. In the callers that grant tokens and then notify (RewardService daily / free egg,
+     QuestService rewards, PetBook rewards, InviteService.process), compare EggTokens.count before and
+     after the add; if nothing was added, show the player "Egg box full: hatch some eggs first" instead of
+     the normal reward toast. CodeService already checks EGG_CAP; copy its approach.
+
+BuildingMerger small ones (all in BuildingMerger):
+  V-3  invalidate(id) during a running merge: the finished merge still publishes the stale model.
+       When the merge finishes, compare the stamp/state captured at the start with the current one
+       and drop the result if invalidate ran meanwhile.
+  V-4  A publish that fails at start is never retried. In startWorker (or wherever publishNow is
+       first attempted), retry a failed publish on the next worker pass.
+  V-5  BuildingMerger.signature(bp) is not pcall'd where it is called; wrap the call so a bad
+       blueprint marks that id failed instead of killing the worker.
+  V-6  awaitTemplate polls at 20 Hz. Replace the poll loop with waiting on the existing `ready`
+       BindableEvent / signal (with the same timeout).
+  V-7  The header comment says unions are CanCollide false / Box; the code collides opaque unions.
+       Update the comment (done together with FIX 12).
+
+
+=====================================================================================================
+FIX 14: TESTS (run all of them; report pass/fail to the user)
+=====================================================================================================
+Remotes live in ReplicatedStorage.Remotes. To act like a hacked client in Studio, run code on the
+CLIENT side (Studio MCP client execution, or the command bar while the client view is selected).
+
+T-1  C-1 dupe is dead
+     Play. Let a build reach about 20 parts. Note your cash. From the client run 20 times, 0.3 s apart:
+	game.ReplicatedStorage.Remotes.VisualProgress:FireServer(0)
+	task.wait(0.15)
+	game.ReplicatedStorage.Remotes.VisualProgress:FireServer(<the current placed count>)
+     PASS: cash only grows by the normal per part pay, not by a full repay each round.
+     Also PASS: a normal build still pays per part and the completion still pays the rest.
+
+T-2  W-1 AFK bonus
+     Play with the AFK feature on and the tutorial done (use the admin panel to finish it).
+     Fire from the client:  Remotes.Afk:FireServer("start")  then keep firing "beat" every 5 s, and
+     walk around. PASS: the bonus chip goes to 0 / AfkService.bonusPercent(player) returns 0 as soon as
+     you move more than 10 studs or use any action remote.
+     Fire  Remotes.Afk:FireServer("busy", true)  while AFK. PASS: bonusPercent returns 0.
+     Teleport data forgery: on a live test place only (TeleportService does not work in Studio); in
+     Studio just check that AfkService.addPlayer never reads afkStart anymore.
+
+T-3  E-1 payday
+     With the admin panel start a BIG PAYDAY event. From the client fire
+	Remotes.VisualProgress:FireServer(<count>, true)
+     a few times. PASS: away income uses only the event's global cash multiplier, not x3.
+
+T-4  W-3 reconnect cancel
+     In Studio the teleport is stubbed (AfkService.calls). Start AFK, let the deadline hit, and fire
+     "active" during the save. PASS: no entry is added to AfkService.calls and Output shows
+     reconnect_cancelled.
+
+T-5  P-4 visits (Team Test, 2 players, or use an offline sample owner id that exists in the store)
+     Visit an offline island, then visit the SAME owner again from the visit panel.
+     PASS: reply "already_here", the player does not fall.
+     Fire  Remotes.Visit:InvokeServer("visit", <offlineUserId>)  twice in the same frame from the client
+     (task.spawn both). PASS: one returns "busy"; after leaving, all VisitService slots are free.
+
+T-6  P-1 gifts (Team Test, 2 players)
+     Gift a pet A to B, B to A, 5 times fast. PASS: saveNow runs at most once per 30 s per pair (add a
+     temporary print in persist if needed, then remove it). Both inventories are correct after rejoin.
+
+T-7  P-2 announce
+     Fuse 5 times in a row. PASS: other clients see at most one ordinary banner per 8 s from that player.
+
+T-8  E-2 quests
+     During a BIG PAYDAY (or AFK) reroll a quest. PASS: the cash reward matches the one rolled outside
+     the event.
+
+T-9  V-1 merges
+     Run BakeMerged, then Play. PASS: no "has no matching prebake" warnings in Output.
+
+T-10 P-3 book
+     Fuse a Rainbow, gift it to player 2 and back (Team Test). PASS: the book's Rainbow slot for that
+     species stays empty. Rejoin and repeat: the fused flag survived the save.
+
+T-11 Regression pass
+     Full Play session: tutorial, hire, build, finish a house, unlock, queue, place / move / replace a
+     building, hatch, fuse, gift, daily reward, free egg, a code, a quest claim, rebirth, visit, cheer,
+     leave and rejoin. PASS: no errors in Output, cash and pets saved after rejoin.
+
+WHEN DONE
+Tell the user which fixes were applied, which were adapted (and how), which were not applied and why,
+and the result of every test. Do not claim a test passed unless you ran it and saw the result.
